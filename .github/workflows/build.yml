@@ -1,0 +1,152 @@
+name: Build Executables
+
+# Runs on every push and can be triggered manually from the Actions tab.
+# Produces two artifacts:
+#   • perf_sharer.exe  — Windows (no Python needed)
+#   • perf_sharer      — Linux   (no Python needed, needs libX11/libXtst)
+# Both are also attached to a rolling "latest-build" pre-release.
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create/update the release
+
+jobs:
+  # ── Build matrix: Windows + Linux ──────────────────────────────────────────
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: perf_sharer.exe
+            pyinstaller_extra: --noconsole
+            dist_path: dist/perf_sharer.exe
+
+          - os: ubuntu-22.04
+            artifact_name: perf_sharer
+            pyinstaller_extra: ''
+            dist_path: dist/perf_sharer
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # tkinter and X11 headers are not bundled in the GitHub-hosted Ubuntu image
+      - name: Install system deps (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y python3-tk libxtst-dev libx11-dev libevdev-dev
+
+      - name: Install Python deps
+        run: pip install pynput pyinstaller
+
+      - name: Build with PyInstaller
+        run: >
+          pyinstaller
+          --onefile
+          ${{ matrix.pyinstaller_extra }}
+          --name perf_sharer
+          --hidden-import server
+          --hidden-import client
+          --hidden-import config
+          --hidden-import transfer
+          --collect-all pynput
+          ui.py
+
+      # Rename so both platforms produce differently-named files
+      - name: Rename artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Move-Item dist\perf_sharer.exe dist\perf_sharer_windows.exe
+
+      - name: Rename artifact (Linux)
+        if: runner.os == 'Linux'
+        run: mv dist/perf_sharer dist/perf_sharer_linux && chmod +x dist/perf_sharer_linux
+
+      # Upload as workflow artifact (90-day retention, downloadable from Actions tab)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            dist/perf_sharer_windows.exe
+            dist/perf_sharer_linux
+          if-no-files-found: error
+
+  # ── Attach both binaries to a rolling "latest-build" pre-release ──────────
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      # Delete any previous "latest-build" release so we can recreate it
+      - name: Delete previous latest-build release (if exists)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest-build --yes --cleanup-tag 2>/dev/null || true
+
+      - name: Create rolling release with binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Collect all built binaries
+          FILES=$(find artifacts -type f | tr '\n' ' ')
+
+          gh release create latest-build \
+            --title "Latest Build ($(date -u '+%Y-%m-%d %H:%M UTC'))" \
+            --notes "$(cat <<'NOTES'
+          ## Downloads
+
+          | File | Platform | Notes |
+          |---|---|---|
+          | `perf_sharer_windows.exe` | Windows 10/11 | Double-click to run — no Python needed |
+          | `perf_sharer_linux` | Ubuntu 22.04+ / Debian | `chmod +x perf_sharer_linux && ./perf_sharer_linux` |
+
+          ## First-time Linux setup
+
+          The binary needs X11 libraries (pre-installed on most desktops):
+          ```bash
+          # Only needed if missing (rare):
+          sudo apt-get install libxtst6 libx11-6
+          ```
+
+          For keyboard suppression (so keys don't fire on both machines at once):
+          ```bash
+          sudo usermod -a -G input $USER   # log out and back in after
+          ```
+
+          ## Usage
+
+          1. **Server** (the laptop with the physical keyboard & mouse):
+             - Launch, choose **Server** mode, click **Start**
+             - Move mouse to the configured screen edge to transfer control
+
+          2. **Client** (the other laptop):
+             - Launch, choose **Client** mode, enter the server's IP, click **Start**
+
+          Auto-reconnects if the connection drops.
+          NOTES
+          )" \
+            --prerelease \
+            --target ${{ github.sha }} \
+            $FILES
