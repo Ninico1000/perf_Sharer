@@ -1,0 +1,423 @@
+"""
+KVM Server — runs on the machine that owns the physical keyboard and mouse.
+
+Responsibilities:
+  • Captures all mouse/keyboard input via pynput (suppress=True)
+  • In local mode  : re-injects events so the server machine behaves normally
+  • In remote mode : forwards events over TCP; cursor stays pinned at the screen edge
+  • Detects screen-edge crossings and sends switch_in / switch_out signals
+
+Linux note: suppress=True on the keyboard listener requires either root or
+membership of the 'input' group:
+    sudo usermod -a -G input $USER   (then log out and back in)
+Mouse suppress has the same requirement.
+"""
+
+import socket
+import threading
+import logging
+import time
+import sys
+
+from pynput import mouse, keyboard
+from pynput.mouse import Controller as MouseCtrl
+from pynput.keyboard import Controller as KeyCtrl
+
+from config import (
+    DEFAULT_PORT, EDGE_THRESHOLD,
+    get_screen_size, send_msg, recv_msg,
+    serialize_key, serialize_button,
+    MSG_SCREEN_INFO, MSG_SWITCH_IN, MSG_SWITCH_OUT,
+    MSG_MOUSE_MOVE, MSG_MOUSE_CLICK, MSG_MOUSE_SCROLL, MSG_KEY,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class KVMServer:
+    """
+    Starts a TCP server and manages mouse/keyboard capture + forwarding.
+
+    Parameters
+    ----------
+    port        : TCP port to listen on
+    remote_side : 'left' or 'right' — which side of the server screen the
+                  remote machine is on
+    """
+
+    def __init__(self, port: int = DEFAULT_PORT, remote_side: str = 'right',
+                 edge_threshold: int = EDGE_THRESHOLD):
+        self.port = port
+        self.remote_side = remote_side
+        self.edge_threshold = edge_threshold
+
+        self.screen_w, self.screen_h = get_screen_size()
+        self._mouse_ctrl = MouseCtrl()
+        self._key_ctrl = KeyCtrl()
+
+        # State
+        self._remote_mode = False
+        self._client_sock: socket.socket | None = None
+        self._client_lock = threading.Lock()
+        self._client_screen = {'w': 1920, 'h': 1080}
+
+        # Remote-mode delta tracking (accumulate raw positions, send deltas)
+        self._last_raw_x = 0
+        self._last_raw_y = 0
+
+        # Suppress fallback tracking
+        self._mouse_suppress = True
+        self._key_suppress = True
+
+        self._running = False
+        self._server_sock: socket.socket | None = None
+        self._mouse_listener = None
+        self._key_listener = None
+
+        # Optional callback for UI status updates: fn(str) -> None
+        self.status_callback = None
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        self._running = True
+        self._start_tcp_server()
+        self._start_mouse_listener()
+        self._start_key_listener()
+        logger.info(
+            f"Server started — screen {self.screen_w}×{self.screen_h}, "
+            f"port {self.port}, remote on {self.remote_side}"
+        )
+        self._set_status("Waiting for client…")
+
+    def stop(self) -> None:
+        self._running = False
+        self._remote_mode = False
+
+        for thing in (self._server_sock, self._client_sock,
+                      self._mouse_listener, self._key_listener):
+            if thing:
+                try:
+                    thing.stop() if hasattr(thing, 'stop') else thing.close()
+                except Exception:
+                    pass
+
+        self._set_status("Stopped")
+
+    # ── Status helper ─────────────────────────────────────────────────────────
+
+    def _set_status(self, msg: str) -> None:
+        logger.info(msg)
+        if self.status_callback:
+            try:
+                self.status_callback(msg)
+            except Exception:
+                pass
+
+    # ── TCP server ────────────────────────────────────────────────────────────
+
+    def _start_tcp_server(self) -> None:
+        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server_sock.bind(('0.0.0.0', self.port))
+        self._server_sock.listen(1)
+        threading.Thread(target=self._accept_loop, daemon=True, name='kvm-accept').start()
+
+    def _accept_loop(self) -> None:
+        while self._running:
+            try:
+                self._server_sock.settimeout(1.0)
+                conn, addr = self._server_sock.accept()
+                logger.info(f"Client connected from {addr[0]}:{addr[1]}")
+                self._set_status(f"Connected: {addr[0]}")
+                threading.Thread(
+                    target=self._handle_client, args=(conn, addr),
+                    daemon=True, name='kvm-client'
+                ).start()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+    def _handle_client(self, conn: socket.socket, addr) -> None:
+        with self._client_lock:
+            # Drop any previous connection
+            old = self._client_sock
+            self._client_sock = conn
+        if old:
+            try:
+                old.close()
+            except Exception:
+                pass
+
+        try:
+            conn.settimeout(10.0)
+
+            # Exchange screen dimensions
+            msg = recv_msg(conn)
+            if msg and msg.get('type') == MSG_SCREEN_INFO:
+                self._client_screen = {'w': msg['w'], 'h': msg['h']}
+                logger.info(f"Client screen: {msg['w']}×{msg['h']}")
+
+            send_msg(conn, {
+                'type': MSG_SCREEN_INFO,
+                'w': self.screen_w,
+                'h': self.screen_h,
+            })
+
+            conn.settimeout(None)
+
+            # Listen for upstream messages (switch_out, pong, …)
+            while self._running:
+                msg = recv_msg(conn)
+                if not msg:
+                    break
+                self._on_client_msg(conn, msg)
+
+        except Exception as e:
+            logger.error(f"Client session error: {e}")
+        finally:
+            with self._client_lock:
+                if self._client_sock is conn:
+                    self._client_sock = None
+            if self._remote_mode:
+                self._exit_remote()
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._set_status("Client disconnected — waiting…")
+
+    def _on_client_msg(self, conn: socket.socket, msg: dict) -> None:
+        t = msg.get('type')
+        if t == MSG_SWITCH_OUT:
+            # Client cursor reached the boundary edge and returned control
+            raw_y = msg.get('y', self.screen_h // 2)
+            self._exit_remote(client_y=raw_y)
+
+    # ── Listeners ─────────────────────────────────────────────────────────────
+
+    def _start_mouse_listener(self) -> None:
+        """Try suppress=True; fall back to False with a warning."""
+        for suppress in (True, False):
+            try:
+                ml = mouse.Listener(
+                    on_move=self._on_move,
+                    on_click=self._on_click,
+                    on_scroll=self._on_scroll,
+                    suppress=suppress,
+                )
+                ml.start()
+                self._mouse_listener = ml
+                self._mouse_suppress = suppress
+                if not suppress:
+                    logger.warning(
+                        "Mouse listener running WITHOUT suppress — clicks will "
+                        "still fire on this machine while in remote mode."
+                    )
+                    self._set_status(
+                        "WARNING: mouse suppress unavailable (run as root or join 'input' group)"
+                    )
+                return
+            except Exception as e:
+                logger.warning(f"Mouse listener suppress={suppress} failed: {e}")
+
+    def _start_key_listener(self) -> None:
+        """Try suppress=True; fall back to False with a warning."""
+        for suppress in (True, False):
+            try:
+                kl = keyboard.Listener(
+                    on_press=self._on_key_press,
+                    on_release=self._on_key_release,
+                    suppress=suppress,
+                )
+                kl.start()
+                self._key_listener = kl
+                self._key_suppress = suppress
+                if not suppress:
+                    logger.warning(
+                        "Keyboard listener running WITHOUT suppress — keys will "
+                        "also fire on this machine while in remote mode."
+                    )
+                return
+            except Exception as e:
+                logger.warning(f"Keyboard listener suppress={suppress} failed: {e}")
+
+    # ── Mouse callbacks ───────────────────────────────────────────────────────
+
+    def _on_move(self, x: int, y: int) -> None:
+        if self._remote_mode:
+            dx = x - self._last_raw_x
+            dy = y - self._last_raw_y
+            self._last_raw_x = x
+            self._last_raw_y = y
+            if dx or dy:
+                self._send({'type': MSG_MOUSE_MOVE, 'dx': dx, 'dy': dy})
+            # No re-injection → cursor stays pinned at edge on server screen
+        else:
+            if self._mouse_suppress:
+                # Re-inject so the cursor actually moves on screen
+                try:
+                    self._mouse_ctrl.position = (x, y)
+                except Exception:
+                    pass
+
+            # Edge detection — only switch if a client is connected
+            with self._client_lock:
+                has_client = self._client_sock is not None
+            if not has_client:
+                return
+
+            if self.remote_side == 'right' and x >= self.screen_w - self.edge_threshold:
+                self._enter_remote(y)
+            elif self.remote_side == 'left' and x <= self.edge_threshold:
+                self._enter_remote(y)
+
+    def _on_click(self, x: int, y: int, button, pressed: bool) -> None:
+        if self._remote_mode:
+            self._send({
+                'type': MSG_MOUSE_CLICK,
+                'button': serialize_button(button),
+                'pressed': pressed,
+            })
+        elif self._mouse_suppress:
+            try:
+                if pressed:
+                    self._mouse_ctrl.press(button)
+                else:
+                    self._mouse_ctrl.release(button)
+            except Exception:
+                pass
+
+    def _on_scroll(self, x: int, y: int, dx: int, dy: int) -> None:
+        if self._remote_mode:
+            self._send({'type': MSG_MOUSE_SCROLL, 'dx': dx, 'dy': dy})
+        elif self._mouse_suppress:
+            try:
+                self._mouse_ctrl.scroll(dx, dy)
+            except Exception:
+                pass
+
+    # ── Keyboard callbacks ────────────────────────────────────────────────────
+
+    def _on_key_press(self, key) -> None:
+        if self._remote_mode:
+            self._send({'type': MSG_KEY, 'action': 'press', **serialize_key(key)})
+        elif self._key_suppress:
+            try:
+                self._key_ctrl.press(key)
+            except Exception as e:
+                logger.debug(f"key re-inject press error: {e}")
+
+    def _on_key_release(self, key) -> None:
+        if self._remote_mode:
+            self._send({'type': MSG_KEY, 'action': 'release', **serialize_key(key)})
+        elif self._key_suppress:
+            try:
+                self._key_ctrl.release(key)
+            except Exception as e:
+                logger.debug(f"key re-inject release error: {e}")
+
+    # ── Mode switching ────────────────────────────────────────────────────────
+
+    def _enter_remote(self, local_y: int) -> None:
+        """Switch to remote mode: pin cursor, notify client."""
+        self._remote_mode = True
+
+        # Anchor the raw-position tracker at the edge
+        if self.remote_side == 'right':
+            anchor_x = self.screen_w - 2
+        else:
+            anchor_x = 1
+        self._last_raw_x = anchor_x
+        self._last_raw_y = local_y
+
+        # Map y proportionally to client screen height
+        client_y = int(local_y * self._client_screen['h'] / self.screen_h)
+
+        # The client cursor enters from the side facing the server
+        entry_side = 'left' if self.remote_side == 'right' else 'right'
+
+        self._send({
+            'type': MSG_SWITCH_IN,
+            'y': client_y,
+            'entry_side': entry_side,
+        })
+        logger.debug(f"→ remote mode (client entry_side={entry_side}, y={client_y})")
+
+    def _exit_remote(self, client_y: int | None = None) -> None:
+        """Return to local mode; warp cursor back to the boundary edge."""
+        self._remote_mode = False
+
+        if client_y is not None:
+            local_y = int(client_y * self.screen_h / self._client_screen['h'])
+            local_y = max(0, min(self.screen_h - 1, local_y))
+            # Cursor reappears on the same side it left from
+            if self.remote_side == 'right':
+                local_x = self.screen_w - 2
+            else:
+                local_x = 1
+            try:
+                self._mouse_ctrl.position = (local_x, local_y)
+            except Exception:
+                pass
+
+        logger.debug("← local mode")
+
+    # ── Network send ──────────────────────────────────────────────────────────
+
+    def _send(self, data: dict) -> None:
+        with self._client_lock:
+            sock = self._client_sock
+        if sock is None:
+            return
+        try:
+            send_msg(sock, data)
+        except OSError as e:
+            logger.warning(f"Send failed: {e}")
+            with self._client_lock:
+                if self._client_sock is sock:
+                    self._client_sock = None
+            if self._remote_mode:
+                self._exit_remote()
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────────
+
+def main() -> None:
+    import argparse
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)-7s %(name)s — %(message)s',
+    )
+
+    ap = argparse.ArgumentParser(description='Software KVM server')
+    ap.add_argument('--port', type=int, default=DEFAULT_PORT)
+    ap.add_argument('--side', choices=['left', 'right'], default='right',
+                    help='Which side of THIS screen the remote machine is on')
+    ap.add_argument('--threshold', type=int, default=EDGE_THRESHOLD,
+                    help='Pixels from edge that trigger a switch')
+    args = ap.parse_args()
+
+    server = KVMServer(port=args.port, remote_side=args.side,
+                       edge_threshold=args.threshold)
+    server.start()
+
+    sw, sh = server.screen_w, server.screen_h
+    print(f"\nKVM Server running")
+    print(f"  Screen : {sw}×{sh}")
+    print(f"  Port   : {args.port}")
+    print(f"  Remote : {args.side} side")
+    print(f"\nMove the mouse to the {args.side} edge to transfer control.")
+    print("Press Ctrl+C to stop.\n")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopping…")
+        server.stop()
+
+
+if __name__ == '__main__':
+    main()
