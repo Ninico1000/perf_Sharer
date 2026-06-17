@@ -374,11 +374,15 @@ class KVMServer:
         if client_y is not None:
             local_y = int(client_y * self.screen_h / self._client_screen['h'])
             local_y = max(0, min(self.screen_h - 1, local_y))
-            # Cursor reappears on the same side it left from
+            # Cursor reappears on the same side it left from, but pulled back
+            # far enough that it doesn't immediately fall inside the
+            # edge-trigger zone again (which would bounce straight back into
+            # remote mode and oscillate).
+            margin = self.edge_threshold + 10
             if self.remote_side == 'right':
-                local_x = self.screen_w - 2
+                local_x = max(0, self.screen_w - margin)
             else:
-                local_x = 1
+                local_x = min(self.screen_w - 1, margin)
             try:
                 self._mouse_ctrl.position = (local_x, local_y)
             except Exception:
