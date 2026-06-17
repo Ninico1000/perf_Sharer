@@ -196,52 +196,83 @@ class KVMServer:
             self._exit_remote(client_y=raw_y)
 
     # ── Listeners ─────────────────────────────────────────────────────────────
+    #
+    # IMPORTANT: suppress=True installs a global OS-level hook that blocks
+    # EVERY keystroke/click before it reaches any app — including the
+    # synthetic ones we re-inject via Controller (SendInput-generated events
+    # pass through the same global hook chain and get swallowed again). So we
+    # must only suppress while actually in remote mode; in local mode the
+    # listener runs with suppress=False (pure pass-through, no re-injection
+    # needed) and we just observe events for edge detection.
 
     def _start_mouse_listener(self) -> None:
-        """Try suppress=True; fall back to False with a warning."""
-        for suppress in (True, False):
+        self._mouse_listener = self._make_mouse_listener(suppress=False)
+
+    def _start_key_listener(self) -> None:
+        self._key_listener = self._make_key_listener(suppress=False)
+
+    def _make_mouse_listener(self, suppress: bool):
+        """Create and start a mouse listener; fall back to the opposite
+        suppress value with a warning if construction fails."""
+        for s in (suppress, not suppress):
             try:
                 ml = mouse.Listener(
                     on_move=self._on_move,
                     on_click=self._on_click,
                     on_scroll=self._on_scroll,
-                    suppress=suppress,
+                    suppress=s,
                 )
                 ml.start()
-                self._mouse_listener = ml
-                self._mouse_suppress = suppress
-                if not suppress:
+                self._mouse_suppress = s
+                if s != suppress:
                     logger.warning(
-                        "Mouse listener running WITHOUT suppress — clicks will "
-                        "still fire on this machine while in remote mode."
+                        f"Mouse listener suppress={suppress} failed — running "
+                        f"with suppress={s} instead."
                     )
-                    self._set_status(
-                        "WARNING: mouse suppress unavailable (run as root or join 'input' group)"
-                    )
-                return
+                return ml
             except Exception as e:
-                logger.warning(f"Mouse listener suppress={suppress} failed: {e}")
+                logger.warning(f"Mouse listener suppress={s} failed: {e}")
+        return None
 
-    def _start_key_listener(self) -> None:
-        """Try suppress=True; fall back to False with a warning."""
-        for suppress in (True, False):
+    def _make_key_listener(self, suppress: bool):
+        """Create and start a keyboard listener; fall back to the opposite
+        suppress value with a warning if construction fails."""
+        for s in (suppress, not suppress):
             try:
                 kl = keyboard.Listener(
                     on_press=self._on_key_press,
                     on_release=self._on_key_release,
-                    suppress=suppress,
+                    suppress=s,
                 )
                 kl.start()
-                self._key_listener = kl
-                self._key_suppress = suppress
-                if not suppress:
+                self._key_suppress = s
+                if s != suppress:
                     logger.warning(
-                        "Keyboard listener running WITHOUT suppress — keys will "
-                        "also fire on this machine while in remote mode."
+                        f"Keyboard listener suppress={suppress} failed — running "
+                        f"with suppress={s} instead."
                     )
-                return
+                return kl
             except Exception as e:
-                logger.warning(f"Keyboard listener suppress={suppress} failed: {e}")
+                logger.warning(f"Keyboard listener suppress={s} failed: {e}")
+        return None
+
+    def _set_suppress_mode(self, suppress: bool) -> None:
+        """Swap the mouse/keyboard listeners to the given suppress mode.
+
+        Called from inside a listener callback's own thread (entering remote
+        mode) or from the client-handler thread (exiting remote mode); both
+        are safe since Listener.stop() only signals the hook thread to unwind
+        after the current callback returns.
+        """
+        old_mouse, old_key = self._mouse_listener, self._key_listener
+        self._mouse_listener = self._make_mouse_listener(suppress)
+        self._key_listener = self._make_key_listener(suppress)
+        for old in (old_mouse, old_key):
+            if old:
+                try:
+                    old.stop()
+                except Exception:
+                    pass
 
     # ── Mouse callbacks ───────────────────────────────────────────────────────
 
@@ -255,12 +286,8 @@ class KVMServer:
                 self._send({'type': MSG_MOUSE_MOVE, 'dx': dx, 'dy': dy})
             # No re-injection → cursor stays pinned at edge on server screen
         else:
-            if self._mouse_suppress:
-                # Re-inject so the cursor actually moves on screen
-                try:
-                    self._mouse_ctrl.position = (x, y)
-                except Exception:
-                    pass
+            # suppress=False in local mode: the OS already moved the cursor
+            # normally, we're just observing for edge detection.
 
             # Edge detection — only switch if a client is connected
             with self._client_lock:
@@ -280,49 +307,27 @@ class KVMServer:
                 'button': serialize_button(button),
                 'pressed': pressed,
             })
-        elif self._mouse_suppress:
-            try:
-                if pressed:
-                    self._mouse_ctrl.press(button)
-                else:
-                    self._mouse_ctrl.release(button)
-            except Exception:
-                pass
 
     def _on_scroll(self, x: int, y: int, dx: int, dy: int) -> None:
         if self._remote_mode:
             self._send({'type': MSG_MOUSE_SCROLL, 'dx': dx, 'dy': dy})
-        elif self._mouse_suppress:
-            try:
-                self._mouse_ctrl.scroll(dx, dy)
-            except Exception:
-                pass
 
     # ── Keyboard callbacks ────────────────────────────────────────────────────
 
     def _on_key_press(self, key) -> None:
         if self._remote_mode:
             self._send({'type': MSG_KEY, 'action': 'press', **serialize_key(key)})
-        elif self._key_suppress:
-            try:
-                self._key_ctrl.press(key)
-            except Exception as e:
-                logger.debug(f"key re-inject press error: {e}")
 
     def _on_key_release(self, key) -> None:
         if self._remote_mode:
             self._send({'type': MSG_KEY, 'action': 'release', **serialize_key(key)})
-        elif self._key_suppress:
-            try:
-                self._key_ctrl.release(key)
-            except Exception as e:
-                logger.debug(f"key re-inject release error: {e}")
 
     # ── Mode switching ────────────────────────────────────────────────────────
 
     def _enter_remote(self, local_y: int) -> None:
         """Switch to remote mode: pin cursor, notify client."""
         self._remote_mode = True
+        self._set_suppress_mode(True)
 
         # Anchor the raw-position tracker at the edge
         if self.remote_side == 'right':
@@ -348,6 +353,7 @@ class KVMServer:
     def _exit_remote(self, client_y: int | None = None) -> None:
         """Return to local mode; warp cursor back to the boundary edge."""
         self._remote_mode = False
+        self._set_suppress_mode(False)
 
         if client_y is not None:
             local_y = int(client_y * self.screen_h / self._client_screen['h'])
