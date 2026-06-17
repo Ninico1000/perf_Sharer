@@ -308,11 +308,20 @@ class KVMServer:
             if x <= margin or x >= self.screen_w - margin or \
                     y <= margin or y >= self.screen_h - margin:
                 cx, cy = self.screen_w // 2, self.screen_h // 2
+                # Update the tracker BEFORE warping the cursor. The warp
+                # itself is observed by this same listener (Windows reports
+                # SetCursorPos-induced movement through the low-level mouse
+                # hook just like real input) and may be delivered re-entrantly
+                # on this thread. If _last_raw_x/y still held the old edge
+                # coordinates when that followup event arrived, its delta
+                # would be the full edge-to-center jump — a bogus huge dx/dy
+                # forwarded to the client that could shove its cursor clean
+                # across its own boundary and bounce control straight back.
+                self._last_raw_x, self._last_raw_y = cx, cy
                 try:
                     self._mouse_ctrl.position = (cx, cy)
                 except Exception:
                     pass
-                self._last_raw_x, self._last_raw_y = cx, cy
             else:
                 self._last_raw_x, self._last_raw_y = x, y
             # No visible re-injection → cursor stays pinned/hidden on server screen
