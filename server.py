@@ -293,11 +293,29 @@ class KVMServer:
         if self._remote_mode:
             dx = x - self._last_raw_x
             dy = y - self._last_raw_y
-            self._last_raw_x = x
-            self._last_raw_y = y
             if dx or dy:
                 self._send({'type': MSG_MOUSE_MOVE, 'dx': dx, 'dy': dy})
-            # No re-injection → cursor stays pinned at edge on server screen
+
+            # The OS clamps its internal cursor position at the screen
+            # bounds even while suppress=True blocks it from being drawn —
+            # so once the real cursor reaches an edge, further movement in
+            # that direction stops producing any delta at all. Re-center it
+            # before that happens so motion keeps being tracked in every
+            # direction; this re-centering itself doesn't go through the
+            # suppressed input hook (SetCursorPos isn't an injected input
+            # event), so it isn't swallowed the way key/click injection was.
+            margin = 100
+            if x <= margin or x >= self.screen_w - margin or \
+                    y <= margin or y >= self.screen_h - margin:
+                cx, cy = self.screen_w // 2, self.screen_h // 2
+                try:
+                    self._mouse_ctrl.position = (cx, cy)
+                except Exception:
+                    pass
+                self._last_raw_x, self._last_raw_y = cx, cy
+            else:
+                self._last_raw_x, self._last_raw_y = x, y
+            # No visible re-injection → cursor stays pinned/hidden on server screen
         else:
             # suppress=False in local mode: the OS already moved the cursor
             # normally, we're just observing for edge detection.
