@@ -115,8 +115,9 @@ class KVMApp:
         status_row = ttk.Frame(sf)
         status_row.pack(fill='x', padx=8, pady=6)
 
+        ttk_bg = ttk.Style().lookup('TFrame', 'background') or CLR_BG
         self._dot = tk.Canvas(status_row, width=14, height=14,
-                               highlightthickness=0, bg=sf.cget('background') if isinstance(sf.cget('background'), str) else CLR_BG)
+                               highlightthickness=0, bg=ttk_bg)
         self._dot.pack(side='left')
         self._dot_id = self._dot.create_oval(2, 2, 12, 12, fill=CLR_GREY, outline='')
 
