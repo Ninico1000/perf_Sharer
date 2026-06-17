@@ -10,6 +10,8 @@ from tkinter import ttk, messagebox
 import logging
 import threading
 import socket
+import sys
+from pathlib import Path
 
 from config import DEFAULT_PORT, get_screen_size
 
@@ -37,6 +39,7 @@ class KVMApp:
 
         self._kvm = None        # KVMServer | KVMClient
         self._running = False
+        self.log_file = None     # set by main(), Path to the log file
 
         self._build_ui()
         self._refresh_local_info()
@@ -132,6 +135,8 @@ class KVMApp:
         self._toggle_btn = ttk.Button(btn_frame, text='Start', width=12,
                                        command=self._toggle)
         self._toggle_btn.pack(side='left', padx=6)
+        ttk.Button(btn_frame, text='Open Log', width=10,
+                   command=self._open_log).pack(side='left', padx=6)
         ttk.Button(btn_frame, text='Quit', width=8,
                    command=self._quit).pack(side='left', padx=6)
 
@@ -263,6 +268,24 @@ class KVMApp:
 
         threading.Thread(target=fetch, daemon=True).start()
 
+    # ── Log file ──────────────────────────────────────────────────────────────
+
+    def _open_log(self) -> None:
+        if not self.log_file:
+            messagebox.showinfo('Log', 'No log file configured for this session.')
+            return
+        import subprocess
+        import platform
+        try:
+            if platform.system() == 'Windows':
+                subprocess.Popen(['notepad.exe', str(self.log_file)])
+            elif platform.system() == 'Darwin':
+                subprocess.Popen(['open', str(self.log_file)])
+            else:
+                subprocess.Popen(['xdg-open', str(self.log_file)])
+        except Exception:
+            messagebox.showinfo('Log file location', str(self.log_file))
+
     # ── Quit ─────────────────────────────────────────────────────────────────
 
     def _quit(self) -> None:
@@ -277,12 +300,36 @@ class KVMApp:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main() -> None:
+def _setup_logging() -> Path:
+    """
+    Configure logging to a file (always) and the console (when one exists).
+
+    A PyInstaller --noconsole build on Windows has no stdout/stderr, so a
+    plain StreamHandler silently loses everything. Writing to a file lets
+    users diagnose issues without a terminal attached.
+    """
+    log_dir = Path.home() / '.perf_sharer'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / 'perf_sharer.log'
+
+    handlers: list[logging.Handler] = [
+        logging.FileHandler(log_file, encoding='utf-8', mode='w')
+    ]
+    if sys.stderr is not None:
+        handlers.append(logging.StreamHandler())
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format='%(asctime)s %(levelname)-7s %(name)s — %(message)s',
+        handlers=handlers,
     )
+    return log_file
+
+
+def main() -> None:
+    log_file = _setup_logging()
     app = KVMApp()
+    app.log_file = log_file
     app.run()
 
 
