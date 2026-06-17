@@ -192,6 +192,11 @@ class KVMApp:
         mode = self._mode.get()
         side = self._side.get()
 
+        self._running = True
+        self._toggle_btn.configure(text='Stop')
+        self._set_dot(CLR_YELLOW)
+        self._apply_status(f"{'Server' if mode == 'server' else 'Client'} starting…")
+
         if mode == 'server':
             from server import KVMServer
             self._kvm = KVMServer(port=port, remote_side=side)
@@ -201,16 +206,14 @@ class KVMApp:
             ip = self._ip.get().strip()
             if not ip:
                 messagebox.showerror('No IP', 'Enter the server IP address.')
+                self._running = False
+                self._toggle_btn.configure(text='Start')
+                self._set_dot(CLR_GREY)
                 return
             from client import KVMClient
             self._kvm = KVMClient(server_ip=ip, port=port)
             self._kvm.status_callback = self._on_status
             self._kvm.start()
-
-        self._running = True
-        self._toggle_btn.configure(text='Stop')
-        self._set_dot(CLR_YELLOW)
-        self._on_status(f"{'Server' if mode == 'server' else 'Client'} starting…")
 
     def _stop(self) -> None:
         if self._kvm:
