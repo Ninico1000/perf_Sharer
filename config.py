@@ -16,7 +16,7 @@ RECONNECT_DELAY = 3.0          # seconds between reconnect attempts
 SOCKET_TIMEOUT = 5.0           # connect timeout
 
 # ── Input ────────────────────────────────────────────────────────────────────
-EDGE_THRESHOLD = 4             # pixels from screen edge that trigger a switch
+EDGE_THRESHOLD = 15            # pixels from screen edge that trigger a switch
 
 # ── Message type constants ────────────────────────────────────────────────────
 MSG_SCREEN_INFO  = 'screen_info'
