@@ -73,6 +73,14 @@ class KVMServer:
         self._move_seen = False
         self._key_seen = False
 
+        # Cooldown: right after leaving remote mode, the freshly (re)started
+        # local listener can deliver a stale on_move callback for the
+        # not-yet-warped cursor position (still sitting at the edge),
+        # which would immediately re-trigger remote mode and cause a
+        # rapid enter/exit oscillation. Edge detection is suppressed
+        # until this deadline.
+        self._edge_cooldown_until = 0.0
+
         self._running = False
         self._server_sock: socket.socket | None = None
         self._mouse_listener = None
@@ -308,6 +316,9 @@ class KVMServer:
             if not has_client:
                 return
 
+            if time.monotonic() < self._edge_cooldown_until:
+                return
+
             if self.remote_side == 'right' and x >= self.screen_w - self.edge_threshold:
                 self._enter_remote(y)
             elif self.remote_side == 'left' and x <= self.edge_threshold:
@@ -369,6 +380,9 @@ class KVMServer:
     def _exit_remote(self, client_y: int | None = None) -> None:
         """Return to local mode; warp cursor back to the boundary edge."""
         self._remote_mode = False
+        # Block edge re-triggering until the cursor has been warped away
+        # from the edge and any stale/in-flight move events have drained.
+        self._edge_cooldown_until = time.monotonic() + 0.4
         self._set_suppress_mode(False)
 
         if client_y is not None:
