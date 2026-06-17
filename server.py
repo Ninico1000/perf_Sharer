@@ -320,9 +320,9 @@ class KVMServer:
                 return
 
             if self.remote_side == 'right' and x >= self.screen_w - self.edge_threshold:
-                self._enter_remote(y)
+                self._enter_remote(x, y)
             elif self.remote_side == 'left' and x <= self.edge_threshold:
-                self._enter_remote(y)
+                self._enter_remote(x, y)
 
     def _on_click(self, x: int, y: int, button, pressed: bool) -> None:
         if self._remote_mode:
@@ -351,17 +351,17 @@ class KVMServer:
 
     # ── Mode switching ────────────────────────────────────────────────────────
 
-    def _enter_remote(self, local_y: int) -> None:
+    def _enter_remote(self, local_x: int, local_y: int) -> None:
         """Switch to remote mode: pin cursor, notify client."""
         self._remote_mode = True
         self._set_suppress_mode(True)
 
-        # Anchor the raw-position tracker at the edge
-        if self.remote_side == 'right':
-            anchor_x = self.screen_w - 2
-        else:
-            anchor_x = 1
-        self._last_raw_x = anchor_x
+        # Anchor the raw-position tracker at the actual position the cursor
+        # crossed the edge at — NOT an artificial edge coordinate. Using a
+        # fake anchor here would make the first move event's delta wrong
+        # (real_x - fake_anchor), producing a bogus jump that could even
+        # immediately push the client back across its own boundary.
+        self._last_raw_x = local_x
         self._last_raw_y = local_y
 
         # Map y proportionally to client screen height
