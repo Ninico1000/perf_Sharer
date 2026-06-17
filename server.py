@@ -69,6 +69,10 @@ class KVMServer:
         self._mouse_suppress = True
         self._key_suppress = True
 
+        # Diagnostics: have we seen the first event from each listener?
+        self._move_seen = False
+        self._key_seen = False
+
         self._running = False
         self._server_sock: socket.socket | None = None
         self._mouse_listener = None
@@ -86,7 +90,8 @@ class KVMServer:
         self._start_key_listener()
         logger.info(
             f"Server started — screen {self.screen_w}×{self.screen_h}, "
-            f"port {self.port}, remote on {self.remote_side}"
+            f"port {self.port}, remote on {self.remote_side} "
+            f"(mouse_suppress={self._mouse_suppress}, key_suppress={self._key_suppress})"
         )
         self._set_status("Waiting for client…")
 
@@ -289,6 +294,14 @@ class KVMServer:
             # suppress=False in local mode: the OS already moved the cursor
             # normally, we're just observing for edge detection.
 
+            if not self._move_seen:
+                self._move_seen = True
+                logger.debug(f"on_move alive — first event x={x} y={y}")
+            near_edge = (self.remote_side == 'right' and x >= self.screen_w - 60) or \
+                        (self.remote_side == 'left' and x <= 60)
+            if near_edge:
+                logger.debug(f"near edge: x={x} y={y} screen_w={self.screen_w}")
+
             # Edge detection — only switch if a client is connected
             with self._client_lock:
                 has_client = self._client_sock is not None
@@ -315,6 +328,9 @@ class KVMServer:
     # ── Keyboard callbacks ────────────────────────────────────────────────────
 
     def _on_key_press(self, key) -> None:
+        if not self._key_seen:
+            self._key_seen = True
+            logger.debug(f"on_key_press alive — first event key={key!r}")
         if self._remote_mode:
             self._send({'type': MSG_KEY, 'action': 'press', **serialize_key(key)})
 
