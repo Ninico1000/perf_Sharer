@@ -291,40 +291,37 @@ class KVMServer:
 
     def _on_move(self, x: int, y: int) -> None:
         if self._remote_mode:
+            cx, cy = self.screen_w // 2, self.screen_h // 2
+
+            # Echo of our own re-center warp: SetCursorPos-induced movement
+            # is reported back through this same low-level hook. Absorb it —
+            # just re-anchor the tracker at the center, forward nothing.
+            # (A real event landing on the exact center pixel is mistaken
+            # for an echo at worst once, losing a single pixel of motion.)
+            if x == cx and y == cy:
+                self._last_raw_x, self._last_raw_y = cx, cy
+                return
+
             dx = x - self._last_raw_x
             dy = y - self._last_raw_y
+            # Anchor on the REAL reported position (not the center): events
+            # that queued up before the warp below takes effect are relative
+            # to each other, so tracking actual positions keeps their deltas
+            # correct; the warp echo above re-anchors us at the center.
+            self._last_raw_x, self._last_raw_y = x, y
             if dx or dy:
                 self._send({'type': MSG_MOUSE_MOVE, 'dx': dx, 'dy': dy})
 
-            # The OS clamps its internal cursor position at the screen
-            # bounds even while suppress=True blocks it from being drawn —
-            # so once the real cursor reaches an edge, further movement in
-            # that direction stops producing any delta at all. Re-center it
-            # before that happens so motion keeps being tracked in every
-            # direction; this re-centering itself doesn't go through the
-            # suppressed input hook (SetCursorPos isn't an injected input
-            # event), so it isn't swallowed the way key/click injection was.
-            margin = 100
-            if x <= margin or x >= self.screen_w - margin or \
-                    y <= margin or y >= self.screen_h - margin:
-                cx, cy = self.screen_w // 2, self.screen_h // 2
-                # Update the tracker BEFORE warping the cursor. The warp
-                # itself is observed by this same listener (Windows reports
-                # SetCursorPos-induced movement through the low-level mouse
-                # hook just like real input) and may be delivered re-entrantly
-                # on this thread. If _last_raw_x/y still held the old edge
-                # coordinates when that followup event arrived, its delta
-                # would be the full edge-to-center jump — a bogus huge dx/dy
-                # forwarded to the client that could shove its cursor clean
-                # across its own boundary and bounce control straight back.
-                self._last_raw_x, self._last_raw_y = cx, cy
-                try:
-                    self._mouse_ctrl.position = (cx, cy)
-                except Exception:
-                    pass
-            else:
-                self._last_raw_x, self._last_raw_y = x, y
-            # No visible re-injection → cursor stays pinned/hidden on server screen
+            # Warp back to the center after EVERY event (the Barrier/Synergy
+            # approach): Windows clamps its internally tracked cursor position
+            # at the screen bounds even while suppress=True hides the motion,
+            # so any drift toward an edge eventually eats all deltas in that
+            # direction. Keeping the cursor pinned at the center means it can
+            # never reach a bound, in any direction.
+            try:
+                self._mouse_ctrl.position = (cx, cy)
+            except Exception:
+                pass
         else:
             # suppress=False in local mode: the OS already moved the cursor
             # normally, we're just observing for edge detection.
@@ -390,6 +387,16 @@ class KVMServer:
         # immediately push the client back across its own boundary.
         self._last_raw_x = local_x
         self._last_raw_y = local_y
+
+        # Move the cursor off the edge right away: it just crossed the
+        # boundary, so it sits at (or clamped against) a screen bound, where
+        # further motion toward the edge produces no deltas at all. _on_move
+        # recognises the resulting hook echo at the exact center and absorbs
+        # it (re-anchoring the tracker there), so this warp forwards nothing.
+        try:
+            self._mouse_ctrl.position = (self.screen_w // 2, self.screen_h // 2)
+        except Exception:
+            pass
 
         # Map y proportionally to client screen height
         client_y = int(local_y * self._client_screen['h'] / self.screen_h)

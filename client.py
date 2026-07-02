@@ -55,6 +55,10 @@ class KVMClient:
         self._entry_side = 'left'     # which edge the cursor entered from
         self._virtual_x = self.screen_w // 2
         self._virtual_y = self.screen_h // 2
+        # Grace period after receiving control during which the boundary
+        # edge only clamps instead of returning control — one stray delta
+        # right after switch_in must not ping-pong control straight back.
+        self._entered_at = 0.0
 
         self._server_screen = {'w': 1920, 'h': 1080}  # updated on connect
 
@@ -193,6 +197,7 @@ class KVMClient:
             logger.debug(f"position set error: {e}")
 
         self._active = True
+        self._entered_at = time.monotonic()
         logger.debug(
             f"→ control received (entry_side={self._entry_side}, "
             f"y={self._virtual_y})"
@@ -207,11 +212,14 @@ class KVMClient:
         new_x = self._virtual_x + dx
         new_y = max(0, min(self.screen_h - 1, self._virtual_y + dy))
 
-        # Check if cursor has crossed back to the server's side
-        if self._entry_side == 'left' and new_x < 0:
-            self._return_control(sock)
-            return
-        if self._entry_side == 'right' and new_x >= self.screen_w:
+        # Check if cursor has crossed back to the server's side. Within the
+        # grace period right after switch_in the edge only clamps — the
+        # cursor spawns 1px inside the entry edge, so any single stray
+        # delta would otherwise bounce control back within milliseconds.
+        in_grace = (time.monotonic() - self._entered_at) < 0.3
+        crossed = (self._entry_side == 'left' and new_x < 0) or \
+                  (self._entry_side == 'right' and new_x >= self.screen_w)
+        if crossed and not in_grace:
             self._return_control(sock)
             return
 
